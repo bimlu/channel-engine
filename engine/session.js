@@ -11,6 +11,7 @@ const { PlayheadState } = require('./playhead_state.js');
 
 const { applyFilter, cloudWatchLog, m3u8Header, logerror, codecsFromString } = require('./util.js');
 const ChaosMonkey = require('./chaos_monkey.js');
+const { log } = require('console');
 
 const EVENT_LIST_LIMIT = 100;
 const AVERAGE_SEGMENT_DURATION = 3000;
@@ -190,6 +191,7 @@ class Session {
     let numberOfLargeTicks = 0;
     let audioIncrement = 1;
     while (state !== PlayheadState.CRASHED) {
+      console.log("startPlayheadAsync:: Tick")
       try {
         const tsIncrementBegin = Date.now();
         const manifest = await this.incrementAsync();
