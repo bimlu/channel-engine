@@ -712,6 +712,7 @@ class Session {
       "vodMediaSeqSubtitle": sessionState.vodMediaSeqSubtitle
     }, isLeader);
     playheadState = { ...playheadState, ...updatedPlayhead };
+    console.log('playheadState:', playheadState)
 
     if (currentVod.sequenceAlwaysContainNewSegments) {
       const mediaSequenceValue = currentVod.mediaSequenceValues[playheadState.vodMediaSeqVideo];
