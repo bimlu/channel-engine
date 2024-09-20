@@ -776,6 +776,7 @@ class Session {
       this.prevMediaSeqOffset.subtitle = playheadState.mediaSeqSubtitle;
     }
 
+    // here getLiveMediaSequences
     let m3u8 = currentVod.getLiveMediaSequences(playheadState.mediaSeq, 180000, playheadState.vodMediaSeqVideo, sessionState.discSeq);
     await this._playheadState.setLastM3u8(m3u8);
     return m3u8;
