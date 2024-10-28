@@ -12,6 +12,7 @@ const { PlayheadState } = require('./playhead_state.js');
 const { applyFilter, cloudWatchLog, m3u8Header, logerror, codecsFromString } = require('./util.js');
 const ChaosMonkey = require('./chaos_monkey.js');
 const { log } = require('console');
+const fs = require('fs')
 
 const EVENT_LIST_LIMIT = 100;
 const AVERAGE_SEGMENT_DURATION = 3000;
@@ -165,6 +166,7 @@ class Session {
   }
 
   async initAsync() {
+    // here
     this._sessionState = await this._sessionStateStore.create(this._sessionId, this._instanceId);
     this._playheadState = await this._playheadStateStore.create(this._sessionId);
 
@@ -178,7 +180,163 @@ class Session {
     return this._sessionId;
   }
 
+  async startPlayheadAsync2() {
+    console.log('>>> session.startPlayheadAsync() started')
+    debug(`[${this._sessionId}]: Playhead consumer started:`);
+    debug(`[${this._sessionId}]: diffThreshold=${this.playheadDiffThreshold}`);
+    debug(`[${this._sessionId}]: maxTickInterval=${this.maxTickInterval}`);
+    debug(`[${this._sessionId}]: averageSegmentDuration=${this.averageSegmentDuration}`);
+
+    console.log(`[${this._sessionId}]: Playhead consumer started:`);
+    console.log(`[${this._sessionId}]: diffThreshold=${this.playheadDiffThreshold}`);
+    console.log(`[${this._sessionId}]: maxTickInterval=${this.maxTickInterval}`);
+    console.log(`[${this._sessionId}]: averageSegmentDuration=${this.averageSegmentDuration}`);
+
+    this.disabledPlayhead = false;
+
+    let playheadState = await this._playheadState.getValues(["state"]);
+    let state = await this._playheadState.setState(PlayheadState.RUNNING);
+    let numberOfLargeTicks = 0;
+    let audioIncrement = 1;
+    while (state !== PlayheadState.CRASHED) {
+      const now = new Date()
+      const nowStr = now.getHours() + ":" + now.getMinutes() + ":" + now.getSeconds() + "." + now.getMilliseconds()
+      console.log("startPlayheadAsync:: Tick", nowStr)
+
+      // saving session info to file for dubugging
+      const sessionJson = JSON.stringify(this)
+      fs.writeFile('sessionData.json', sessionJson, 'utf8', (err) => {
+        if (err) {
+          console.error('Error writing file:', err);
+        } else {
+          console.log('File has been saved successfully!');
+        }
+      });
+
+      try {
+        const tsIncrementBegin = Date.now();
+
+        // -----------------HERE-------------------//
+        const manifest = await this.incrementAsync();
+        // console.log('>>> session.startPlayheadAsync().manifest:', manifest)
+
+        if (!manifest) {
+          debug(`[${this._sessionId}]: No manifest available yet, will try again after 1000ms`);
+          await timer(1000);
+          continue;
+        }
+        const tsIncrementEnd = Date.now();
+        const sessionState = await this._sessionState.getValues(["state"]);
+        playheadState = await this._playheadState.getValues(["tickInterval", "playheadRef", "tickMs"]);
+        state = await this._playheadState.getState();
+
+        const isLeader = await this._sessionStateStore.isLeader(this._instanceId);
+        // console.log('>>>session.startPlayheadAsync().isLeader:', isLeader)
+        // console.log('>>>session.startPlayheadAsync().sessionState.state):', sessionState.state)
+        if (isLeader &&
+          [
+            SessionState.VOD_NEXT_INIT,
+            SessionState.VOD_NEXT_INITIATING,
+            SessionState.VOD_RELOAD_INIT,
+            SessionState.VOD_RELOAD_INITIATING
+          ].indexOf(sessionState.state) !== -1) {
+
+          // ----------------------------------------------------------
+          const firstDuration = await this._getFirstDuration(manifest);
+          const tickInterval = firstDuration < 2 ? 2 : firstDuration;
+          debug(`[${this._sessionId}]: I am the leader and updated tick interval to ${tickInterval} sec`);
+          cloudWatchLog(!this.cloudWatchLogging, 'engine-session',
+            { event: 'tickIntervalUpdated', channel: this._sessionId, tickIntervalSec: tickInterval });
+          this._playheadState.set("tickInterval", tickInterval, isLeader);
+        } else if (state == PlayheadState.STOPPED) {
+          debug(`[${this._sessionId}]: Stopping playhead`);
+          return;
+        } else {
+          const reqTickInterval = playheadState.tickInterval;
+          const timeSpentInIncrement = (tsIncrementEnd - tsIncrementBegin) / 1000;
+          let tickInterval = reqTickInterval - timeSpentInIncrement;
+          // Apply HLSVod delta time for current msequence.
+          const delta = await this._getCurrentDeltaTime();
+          if (delta != 0) {
+            tickInterval += delta;
+            debug(`[${this._sessionId}]: Delta time is != 0 need will adjust ${delta}sec to tick interval. tick=${tickInterval}`);
+          }
+          const position = (await this._getCurrentPlayheadPosition()) * 1000;
+          let timePosition = Date.now() - playheadState.playheadRef;
+          // Apply time position offset if set, only after external diff compensation has concluded.
+          if (this.timePositionOffset && this.diffCompensation <= 0 && this.alwaysNewSegments) {
+            timePosition -= this.timePositionOffset;
+            cloudWatchLog(!this.cloudWatchLogging, 'engine-session',
+              { event: 'applyTimePositionOffset', channel: this._sessionId, offsetMs: this.timePositionOffset });
+          }
+          const diff = position - timePosition;
+          debug(`[${this._sessionId}]: ${timePosition}:${position}:${diff > 0 ? '+' : ''}${diff}ms`);
+          cloudWatchLog(!this.cloudWatchLogging, 'engine-session',
+            { event: 'playheadDiff', channel: this._sessionId, diffMs: diff });
+          if (this.alwaysNewSegments) {
+            // Apply Playhead diff compensation, only after external diff compensation has concluded.
+            if (this.diffCompensation <= 0) {
+              const timeToAdd = this._getPlayheadDiffCompensationValue(diff, this.playheadDiffThreshold);
+              tickInterval += timeToAdd;
+            }
+          } else {
+            // Apply Playhead diff compensation, always.
+            const timeToAdd = this._getPlayheadDiffCompensationValue(diff, this.playheadDiffThreshold);
+            tickInterval += timeToAdd;
+          }
+          // Apply external diff compensation if available.
+          if (this.diffCompensation && this.diffCompensation > 0) {
+            const DIFF_COMPENSATION = (reqTickInterval * this.diffCompensationRate).toFixed(2) * 1000;
+            debug(`[${this._sessionId}]: Adding ${DIFF_COMPENSATION}msec to tickInterval to compensate for schedule diff (current=${this.diffCompensation}msec)`);
+            tickInterval += (DIFF_COMPENSATION / 1000);
+            this.diffCompensation -= DIFF_COMPENSATION;
+          }
+          // Keep tickInterval within upper and lower limits.
+          debug(`[${this._sessionId}]: Requested tickInterval=${tickInterval}s (max=${this.maxTickInterval / 1000}s, diffThreshold=${this.playheadDiffThreshold}msec)`);
+          if (tickInterval <= 0.5) {
+            tickInterval = 0.5;
+          } else if (tickInterval > (this.maxTickInterval / 1000)) {
+            const changeMaxTick = Math.ceil(Math.abs(tickInterval * 1000 - (this.maxTickInterval))) + 1000;
+            if (this.maxTickIntervalIsDefault) {
+              if (numberOfLargeTicks > 2) {
+                this.maxTickInterval += changeMaxTick;
+                numberOfLargeTicks = 0;
+              } else {
+                numberOfLargeTicks++;
+              }
+            } else {
+              console.warn(`[${this._sessionId}]: Playhead tick interval went over Max tick interval by ${changeMaxTick}ms.
+              If the value keeps increasing, consider increasing the 'maxTickInterval' in engineOptions`);
+            }
+            tickInterval = this.maxTickInterval / 1000;
+          }
+          debug(`[${this._sessionId}]: (${(new Date()).toISOString()}) ${timeSpentInIncrement}sec in increment. Next tick in ${tickInterval} seconds`)
+          await timer((tickInterval * 1000) - 50);
+          const tsTickEnd = Date.now();
+          await this._playheadState.set("tickMs", (tsTickEnd - tsIncrementBegin), isLeader);
+          cloudWatchLog(!this.cloudWatchLogging, 'engine-session',
+            { event: 'tickInterval', channel: this._sessionId, tickTimeMs: (tsTickEnd - tsIncrementBegin) });
+          if (this.alwaysNewSegments) {
+            // Use dynamic base-tickInterval. Set according to duration of latest segment.
+            const lastDuration = await this._getLastDuration(manifest);
+            const nextTickInterval = lastDuration < 2 ? 2 : lastDuration;
+            await this._playheadState.set("tickInterval", nextTickInterval, isLeader);
+            cloudWatchLog(!this.cloudWatchLogging, "engine-session", { event: "tickIntervalUpdated", channel: this._sessionId, tickIntervalSec: nextTickInterval });
+          }
+        }
+      } catch (err) {
+        debug(`[${this._sessionId}]: Playhead consumer crashed (1)`);
+        console.error(`[${this._sessionId}]: ${err.message}`);
+        cloudWatchLog(!this.cloudWatchLogging, 'engine-session',
+          { event: 'error', on: 'playhead', channel: this._sessionId, err: err });
+        debug(err);
+        state = await this._playheadState.setState(PlayheadState.CRASHED);
+      }
+    }
+  }
+
   async startPlayheadAsync() {
+    console.log('>>> session.startPlayheadAsync() started')
     debug(`[${this._sessionId}]: Playhead consumer started:`);
     debug(`[${this._sessionId}]: diffThreshold=${this.playheadDiffThreshold}`);
     debug(`[${this._sessionId}]: maxTickInterval=${this.maxTickInterval}`);
@@ -195,6 +353,7 @@ class Session {
       try {
         const tsIncrementBegin = Date.now();
         const manifest = await this.incrementAsync();
+        console.log('>>> session.startPlayheadAsync().manifest:', manifest)
         if (!manifest) {
           debug(`[${this._sessionId}]: No manifest available yet, will try again after 1000ms`);
           await timer(1000);
@@ -206,6 +365,8 @@ class Session {
         state = await this._playheadState.getState();
 
         const isLeader = await this._sessionStateStore.isLeader(this._instanceId);
+        console.log('>>>session.startPlayheadAsync().isLeader:', isLeader)
+        console.log('>>>session.startPlayheadAsync().sessionState.state):', sessionState.state)
         if (isLeader &&
           [
             SessionState.VOD_NEXT_INIT,
@@ -712,7 +873,7 @@ class Session {
       "vodMediaSeqSubtitle": sessionState.vodMediaSeqSubtitle
     }, isLeader);
     playheadState = { ...playheadState, ...updatedPlayhead };
-    console.log('playheadState:', playheadState)
+    // console.log('playheadState:', playheadState)
 
     if (currentVod.sequenceAlwaysContainNewSegments) {
       const mediaSequenceValue = currentVod.mediaSequenceValues[playheadState.vodMediaSeqVideo];
@@ -777,8 +938,11 @@ class Session {
     }
 
     // here getLiveMediaSequences
+    // 
     let m3u8 = currentVod.getLiveMediaSequences(playheadState.mediaSeq, 180000, playheadState.vodMediaSeqVideo, sessionState.discSeq);
-    await this._playheadState.setLastM3u8(m3u8);
+    // console.log('>>> session.incrementAsync().getLiveMediaSequences().args:', playheadState.mediaSeq, 180000, playheadState.vodMediaSeqVideo, sessionState.discSeq)
+    // console.log('>>> session.incrementAsync().m3u8:', m3u8)
+    await this._playheadState.setLastM3u8(m3u8); // >>> session._sessionStateStore._playheadState.lastM3u8:
     return m3u8;
   }
 
@@ -1132,6 +1296,7 @@ class Session {
     let isLeader = await this._sessionStateStore.isLeader(this._instanceId);
 
     let currentVod = await this._sessionState.getCurrentVod();
+    // console.log('>>> session._tickAsync.currentVod:', currentVod)
     let vodResponse;
 
     if (!sessionState.state) {
@@ -1157,6 +1322,7 @@ class Session {
           if (isLeader) {
             const nextVodStart = Date.now();
             vodResponse = await nextVodPromise;
+            console.log('>>> session._tickAsync.vodResponse:', vodResponse)
             sessionState.nextVod = await this._sessionState.set("nextVod", vodResponse);
             cloudWatchLog(!this.cloudWatchLogging, 'engine-session',
               { event: 'nextVod', channel: this._sessionId, reqTimeMs: Date.now() - nextVodStart });
@@ -1173,6 +1339,7 @@ class Session {
                 skipSerializeMediaSequences: this.partialStoreHLSVod
               };
               newVod = new HLSVod(vodResponse.uri, [], vodResponse.unixTs, vodResponse.offset * 1000, m3u8Header(this._instanceId), hlsOpts);
+              console.log('>>> session._tickAsync.newVod:', newVod)
               if (vodResponse.timedMetadata) {
                 Object.keys(vodResponse.timedMetadata).map(k => {
                   newVod.addMetadata(k, vodResponse.timedMetadata[k]);
@@ -1559,6 +1726,7 @@ class Session {
   }
 
   _getNextVod() {
+    console.log('>>> session._getNextVod()')
     return new Promise((resolve, reject) => {
       let nextVodPromise;
 
@@ -1779,6 +1947,7 @@ class Session {
   }
 
   _getNextVodById(id) {
+    console.log('>>> session._getNextVodById()')
     return new Promise((resolve, reject) => {
       this._assetManager.getNextVodById(this._sessionId, id)
         .then(nextVod => {
@@ -2064,6 +2233,7 @@ class Session {
         let parsedGroupId;
         let parsedLang;
         if (variantType === "video") {
+          // here
           m3u8 = currentVod.getLiveMediaSequences(
             playheadState[MSDKeys.mediaSeq],
             variantKey,

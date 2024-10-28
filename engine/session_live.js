@@ -69,6 +69,7 @@ class SessionLive {
   }
 
   async initAsync() {
+    // here
     this.sessionLiveState = await this.sessionLiveStateStore.create(this.sessionId, this.instanceId);
   }
 
@@ -131,6 +132,7 @@ class SessionLive {
   }
 
   async startPlayheadAsync() {
+    console.log('>>> session_live.startPlayheadAsync() started')
     debug(`[${this.sessionId}]: SessionLive-Playhead consumer started`);
     this.playheadState = PlayheadState.RUNNING;
     while (this.playheadState !== PlayheadState.CRASHED) {

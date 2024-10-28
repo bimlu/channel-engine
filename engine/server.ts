@@ -337,10 +337,12 @@ export class ChannelEngine {
       debug(req.params);
       let m;
       if (req.params.file.match(/master.m3u8/)) {
+        console.log(">>> Handling master request:")
         await this._handleMasterManifest(req, res, next);
       } else if (m = req.params.file.match(/master(\d+).m3u8;session=(.*)$/)) {
         req.params[0] = m[1];
         req.params[1] = m[2];
+        console.log(">>> Handling media manifest request, params:", req.params)
         await this._handleMediaManifest(req, res, next);
       } else if (m = req.params.file.match(/master-(\S+)_(\S+).m3u8;session=(.*)$/)) {
         req.params[0] = m[1];
@@ -461,8 +463,8 @@ export class ChannelEngine {
   async updateChannelsAsync(channelMgr, options) {
     debug(`Do we have any new channels?`);
 
-    console.log('>>> updateChannelsAsync().sessions:', sessions)
-    console.log('>>> updateChannelsAsync().channelMgr.channels:', channelMgr.getChannels())
+    // console.log('>>> updateChannelsAsync().sessions:', sessions)
+    // console.log('>>> updateChannelsAsync().channelMgr.channels:', channelMgr.getChannels())
     const newChannels = channelMgr.getChannels().filter(channel => !sessions[channel.id]);
     console.log(newChannels)
 
@@ -596,7 +598,8 @@ export class ChannelEngine {
         sessionEventStream: options.sessionEventStream
       }, this.sessionStore);
 
-      console.log('>>> updateChannelsAsync2().addAsync().sessions:', sessions)
+      // console.log('>>> updateChannelsAsync2().addAsync().sessions:', sessions)
+      console.log('>>> updateChannelsAsync2().addAsync().sessions:', JSON.stringify(sessions, null));
 
       sessionsLive[channel.id] = new SessionLive({
         sessionId: channel.id,
@@ -611,12 +614,7 @@ export class ChannelEngine {
       console.log('>>> updateChannelsAsync2().addAsync().sessionsLive:', sessionsLive)
 
       await sessions[channel.id].initAsync();
-      await sessionsLive[channel.id].initAsync();
-      if (!this.monitorTimer[channel.id]) {
-        this.monitorTimer[channel.id] = setInterval(async () => { await this._monitorAsync(sessions[channel.id], sessionsLive[channel.id]) }, 5000);
-      }
-
-      await sessions[channel.id].startPlayheadAsync();
+      await sessions[channel.id].startPlayheadAsync2();
     };
 
     await Promise.all(
@@ -842,6 +840,7 @@ export class ChannelEngine {
     }
 
     if (session) {
+      // console.log(">>> ChannelEngine._handleMasterManifest.session: Before:", session)
       const eventStream = new EventStream(session);
       eventStreams[session.sessionId] = eventStream;
 
@@ -852,6 +851,8 @@ export class ChannelEngine {
       }
 
       try {
+      
+        console.log(">>> ChannelEngine._handleMasterManifest.session: After:", session)
         const body = await session.getMasterManifestAsync(filter);
         res.sendRaw(200, Buffer.from(body, 'utf8'), {
           "Content-Type": "application/vnd.apple.mpegurl",
@@ -958,7 +959,9 @@ export class ChannelEngine {
 
   async _handleMediaManifest(req, res, next) {
     debug(`x-playback-session-id=${req.headers["x-playback-session-id"]} req.url=${req.url}`);
+    console.log(`x-playback-session-id=${req.headers["x-playback-session-id"]} req.url=${req.url}`);
     debug(req.params);
+    console.log('req.params:', req.params);
     const session = sessions[req.params[1]];
     const sessionLive = sessionsLive[req.params[1]];
     if (session && sessionLive) {
@@ -966,6 +969,8 @@ export class ChannelEngine {
         let body = null;
         if (!this.streamSwitchManager) {
           debug(`[${req.params[1]}]: Responding with VOD2Live manifest`);
+          console.log(`>>> [${req.params[1]}]: Responding with VOD2Live manifest`);
+          console.log('>>> server.ChannelEngine._handleMediaManifest.session:', session)
           body = await session.getCurrentMediaManifestAsync(req.params[0], req.headers["x-playback-session-id"]);
         } else {
           while (switcherStatus[req.params[1]] === null || switcherStatus[req.params[1]] === undefined) {
